@@ -6,7 +6,7 @@ import numpy as np
 import faiss
 import tempfile
 from embedder import embed_batch, get_device
-from faiss_index import build_index, save_index
+from faiss_index import build_index, save_index, load_index
 from typing import List, Dict, Generator
 
 # --- STORAGE PROTECTION ---
@@ -51,61 +51,78 @@ def stream_csv(path: str) -> Generator[Dict, None, None]:
         for row in reader:
             yield row
 
-def ingest_large_dataset():
+def ingest_large_dataset(additional_limit: int = 50000):
     input_csv = "job_skills.csv"
     output_metadata = "jobs.csv"
     output_index = "jobs.index"
     
-    # LIMITs and Filters
-    ROW_LIMIT = 50000 
-    MIN_SKILLS_LENGTH = 30 # Ignore very short skill lists
-    BATCH_SIZE = 1000 # Number of jobs to process/embed at once
+    # QUALITY Filters
+    MIN_SKILLS_LENGTH = 30 
+    BATCH_SIZE = 1000 
 
     if not os.path.exists(input_csv):
         print(f"Error: {input_csv} not found.")
         return
 
-    print(f"Starting large-scale ingestion with DEDUPLICATION and QUALITY FILTERS.")
-    print(f"Using device: {get_device()}. Target limit: {ROW_LIMIT} unique jobs.")
+    print(f"Starting INCREMENTAL ingestion with DEDUPLICATION and QUALITY FILTERS.")
+    print(f"Using device: {get_device()}. Adding {additional_limit} NEW unique jobs.")
 
     index = None
     seen_hashes = set()
-    total_processed = 0
+    existing_jobs = []
+    
+    # 1. Load existing data if available
+    if os.path.exists(output_metadata) and os.path.exists(output_index):
+        print("Loading existing metadata and index...")
+        index = load_index(output_index)
+        with open(output_metadata, mode='r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                existing_jobs.append(row)
+                # Rebuild hashes for global deduplication
+                h = hashlib.md5(f"{row['title']}|{row['description']}".encode('utf-8')).hexdigest()
+                seen_hashes.add(h)
+        print(f"Resuming with {len(existing_jobs)} existing unique entries.")
+    else:
+        print("No existing index found. Starting fresh.")
+
+    total_processed = len(existing_jobs)
+    new_jobs_processed = 0
     total_scanned = 0
     
     batch_texts = []
     batch_metadata = []
     
-    # We'll use a local CSV to write mapped metadata incrementally
-    with open(output_metadata, mode='w', newline='', encoding='utf-8') as out_f:
+    # We'll use 'a' (append) mode if we are resuming
+    file_mode = 'a' if existing_jobs else 'w'
+    
+    with open(output_metadata, mode=file_mode, newline='', encoding='utf-8') as out_f:
         writer = csv.DictWriter(out_f, fieldnames=["id", "title", "description"])
-        writer.header = False
-        writer.writeheader()
+        if file_mode == 'w':
+            writer.writeheader()
 
         for i, row in enumerate(stream_csv(input_csv)):
             total_scanned += 1
             url = row.get("job_link", "")
             skills = row.get("job_skills", "").strip()
             
-            # 1. Quality Filter: Skip empty or short skills
+            # Quality Filter
             if not skills or skills == 'None' or len(skills) < MIN_SKILLS_LENGTH:
                 continue
                 
             title = extract_title_from_url(url)
-            
-            # 2. Quality Filter: Skip unknown titles
             if title == "Unknown Job Title":
                 continue
             
-            # 3. Deduplication: Use hash of Title + Skills
+            # Deduplication
             data_hash = hashlib.md5(f"{title}|{skills}".encode('utf-8')).hexdigest()
             if data_hash in seen_hashes:
                 continue
             seen_hashes.add(data_hash)
             
-            # Prepare metadata row
+            # New Job metadata
             job_meta = {
-                "id": str(total_processed),
+                "id": str(total_processed + new_jobs_processed),
                 "title": title,
                 "description": skills 
             }
@@ -115,7 +132,7 @@ def ingest_large_dataset():
             
             # When batch is full, embed and add to index
             if len(batch_texts) >= BATCH_SIZE:
-                print(f"Embedding batch of {BATCH_SIZE} (Total Unique: {total_processed + BATCH_SIZE})...")
+                print(f"Embedding batch of {BATCH_SIZE} (Total New: {new_jobs_processed + BATCH_SIZE})...")
                 vectors = embed_batch(batch_texts, batch_size=64) 
                 
                 if index is None:
@@ -125,16 +142,16 @@ def ingest_large_dataset():
                 index.add(vectors.astype("float32"))
                 writer.writerows(batch_metadata)
                 
-                total_processed += len(batch_texts)
+                new_jobs_processed += len(batch_texts)
                 batch_texts = []
                 batch_metadata = []
                 
-            if total_processed >= ROW_LIMIT:
-                print(f"Reached unique job limit of {ROW_LIMIT}. Stopping...")
+            if new_jobs_processed >= additional_limit:
+                print(f"Reached additional limit of {additional_limit}. Total: {total_processed + new_jobs_processed}")
                 break
 
             if total_scanned % 10000 == 0:
-                 print(f"Status: Scanned {total_scanned} rows, Processed {total_processed} unique...")
+                 print(f"Status: Scanned {total_scanned} rows, New processing {new_jobs_processed} unique...")
 
         # Process final partial batch
         if batch_texts:
@@ -144,16 +161,16 @@ def ingest_large_dataset():
                 index = faiss.IndexFlatIP(vectors.shape[1])
             index.add(vectors.astype("float32"))
             writer.writerows(batch_metadata)
-            total_processed += len(batch_texts)
+            new_jobs_processed += len(batch_texts)
 
     if index:
         save_index(index, output_index)
-        print(f"Deduplication summary: Scanned {total_scanned} rows -> {total_processed} unique high-quality jobs.")
-        print(f"Successfully indexed {total_processed} jobs.")
-        print(f"FAISS index saved to {output_index}")
-        print(f"Metadata saved to {output_metadata}")
+        print(f"Deduplication summary: Scanned {total_scanned} rows -> {new_jobs_processed} NEW unique jobs.")
+        print(f"Total Database Size: {total_processed + new_jobs_processed} jobs.")
+        print(f"FAISS index updated at {output_index}")
+        print(f"Metadata updated at {output_metadata}")
     else:
         print("No valid data found to index.")
 
 if __name__ == "__main__":
-    ingest_large_dataset()
+    ingest_large_dataset(additional_limit=50000)
