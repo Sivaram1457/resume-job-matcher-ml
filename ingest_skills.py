@@ -173,4 +173,4 @@ def ingest_large_dataset(additional_limit: int = 50000):
         print("No valid data found to index.")
 
 if __name__ == "__main__":
-    ingest_large_dataset(additional_limit=50000)
+    ingest_large_dataset(additional_limit=100000)
